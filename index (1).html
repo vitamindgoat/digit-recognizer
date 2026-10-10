@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Digit Recognizer</title>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4/dist/tf.min.js"></script>
+<style>
+  body { font-family: system-ui, sans-serif; background: #f6f7f9; color: #222; margin: 0; padding: 16px; }
+  .wrap { max-width: 720px; margin: 0 auto; }
+  h1 { margin: 0 0 4px; font-size: 26px; }
+  .sub { margin: 0 0 16px; color: #555; }
+  .row { display: flex; gap: 20px; flex-wrap: wrap; }
+  .card { background: #fff; border-radius: 12px; padding: 14px; box-shadow: 0 1px 4px rgba(0,0,0,.08); }
+  #pad { border: 2px solid #ccc; border-radius: 8px; touch-action: none; cursor: crosshair; width: 280px; height: 280px; }
+  button { margin-top: 8px; padding: 8px 16px; font-size: 15px; border: none; border-radius: 8px; background: #222; color: #fff; cursor: pointer; }
+  #guess { font-size: 48px; font-weight: 700; margin: 0; }
+  #conf { color: #555; margin-bottom: 10px; }
+  .bar { display: flex; align-items: center; gap: 6px; font-size: 14px; margin: 2px 0; }
+  .bar span { width: 12px; }
+  .fill { height: 12px; background: #4a7dff; border-radius: 3px; }
+  #seen { width: 84px; height: 84px; image-rendering: pixelated; border: 1px solid #ccc; margin-top: 4px; }
+  #status { color: #888; font-size: 14px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Handwritten Digit Recognizer</h1>
+  <p class="sub">A CNN trained on MNIST, then fine-tuned on my own handwriting. Runs entirely in your browser. Built by OLEKSANDR RYBITSKYI.</p>
+  <div class="row">
+    <div class="card">
+      <canvas id="pad" width="280" height="280"></canvas><br>
+      <button id="clear">Clear</button>
+    </div>
+    <div class="card" style="min-width:220px">
+      <div id="status">Loading model...</div>
+      <p id="guess">-</p>
+      <div id="conf"></div>
+      <div id="bars"></div>
+      <div style="font-size:13px; color:#555; margin-top:8px">What the model sees (28x28):</div>
+      <canvas id="seen" width="28" height="28"></canvas>
+    </div>
+  </div>
+</div>
+<script>
+const pad = document.getElementById("pad"), ctx = pad.getContext("2d");
+const seenCtx = document.getElementById("seen").getContext("2d");
+let model = null, drawing = false, timer = null;
+
+function drawBars(probs) {
+  let html = "";
+  for (let i = 0; i < 10; i++) {
+    const p = probs ? probs[i] : 0;
+    html += `<div class="bar"><span>${i}</span><div class="fill" style="width:${Math.round(p * 150)}px"></div><small>${probs ? (p * 100).toFixed(0) + "%" : ""}</small></div>`;
+  }
+  document.getElementById("bars").innerHTML = html;
+}
+
+function clearOutputs() {
+  document.getElementById("guess").innerText = "-";
+  document.getElementById("conf").innerText = "";
+  drawBars(null);
+  seenCtx.clearRect(0, 0, 28, 28);
+}
+
+function clearPad() {
+  ctx.fillStyle = "white"; ctx.fillRect(0, 0, 280, 280);
+  clearOutputs();
+}
+ctx.lineWidth = 10; ctx.lineCap = "round"; ctx.lineJoin = "round"; ctx.strokeStyle = "black";
+clearPad();
+
+function pos(e) {
+  const r = pad.getBoundingClientRect();
+  return [(e.clientX - r.left) * 280 / r.width, (e.clientY - r.top) * 280 / r.height];
+}
+pad.addEventListener("pointerdown", e => { drawing = true; ctx.beginPath(); ctx.moveTo(...pos(e)); });
+pad.addEventListener("pointermove", e => { if (drawing) { ctx.lineTo(...pos(e)); ctx.stroke(); } });
+window.addEventListener("pointerup", () => {
+  if (!drawing) return;
+  drawing = false; clearTimeout(timer); timer = setTimeout(predict, 150);
+});
+document.getElementById("clear").onclick = clearPad;
+
+// Same steps as the Python preprocess: threshold, crop, thicken, square, shrink to 20x20, center in 28x28
+function preprocess() {
+  const W = 280, H = 280, d = ctx.getImageData(0, 0, W, H).data;
+  const on = new Uint8Array(W * H);
+  let r0 = H, r1 = -1, c0 = W, c1 = -1;
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const i = y * W + x, gray = (d[4 * i] + d[4 * i + 1] + d[4 * i + 2]) / 3;
+    if ((255 - gray) / 255 > 0.5) {
+      on[i] = 1;
+      if (y < r0) r0 = y; if (y > r1) r1 = y; if (x < c0) c0 = x; if (x > c1) c1 = x;
+    }
+  }
+  if (r1 < 0) return null;
+
+  const h = r1 - r0 + 1, w = c1 - c0 + 1;
+  let a = new Uint8Array(h * w);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) a[y * w + x] = on[(y + r0) * W + (x + c0)];
+
+  const iters = Math.max(1, Math.floor(Math.max(h, w) / 20));
+  for (let it = 0; it < iters; it++) {
+    const b = a.slice();
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const k = y * w + x;
+      if (!a[k] && ((y > 0 && a[k - w]) || (y < h - 1 && a[k + w]) || (x > 0 && a[k - 1]) || (x < w - 1 && a[k + 1]))) b[k] = 1;
+    }
+    a = b;
+  }
+
+  const s = Math.max(h, w), oy = Math.floor((s - h) / 2), ox = Math.floor((s - w) / 2);
+  const sq = new Float32Array(s * s);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) sq[(y + oy) * s + (x + ox)] = a[y * w + x];
+
+  const c = new Float32Array(784);
+  for (let i = 0; i < 20; i++) for (let j = 0; j < 20; j++) {
+    const y0 = Math.floor(i * s / 20), y1 = Math.max(y0 + 1, Math.floor((i + 1) * s / 20));
+    const x0 = Math.floor(j * s / 20), x1 = Math.max(x0 + 1, Math.floor((j + 1) * s / 20));
+    let sum = 0, n = 0;
+    for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) { sum += sq[y * s + x]; n++; }
+    c[(i + 4) * 28 + (j + 4)] = sum / n;
+  }
+
+  let m = 0, sy = 0, sx = 0;
+  for (let y = 0; y < 28; y++) for (let x = 0; x < 28; x++) { const v = c[y * 28 + x]; m += v; sy += y * v; sx += x * v; }
+  const dy = Math.round(13.5 - sy / m), dx = Math.round(13.5 - sx / m);
+  const out = new Float32Array(784);
+  for (let y = 0; y < 28; y++) for (let x = 0; x < 28; x++) {
+    const ny = y + dy, nx = x + dx;
+    if (ny >= 0 && ny < 28 && nx >= 0 && nx < 28) out[ny * 28 + nx] = c[y * 28 + x];
+  }
+  return out;
+}
+
+function showSeen(arr) {
+  const img = seenCtx.createImageData(28, 28);
+  for (let k = 0; k < 784; k++) {
+    const v = Math.round(arr[k] * 255);
+    img.data[4 * k] = v; img.data[4 * k + 1] = v; img.data[4 * k + 2] = v; img.data[4 * k + 3] = 255;
+  }
+  seenCtx.putImageData(img, 0, 0);
+}
+
+async function predict() {
+  if (!model) return;
+  const arr = preprocess();
+  if (!arr) { clearOutputs(); return; }
+  showSeen(arr);
+  const t = tf.tidy(() => model.predict(tf.tensor4d(arr, [1, 28, 28, 1])));
+  const probs = Array.from(t.dataSync());
+  t.dispose();
+  const best = probs.indexOf(Math.max(...probs));
+  document.getElementById("guess").innerText = best;
+  document.getElementById("conf").innerText = `${(probs[best] * 100).toFixed(0)}% confident`;
+  drawBars(probs);
+}
+
+async function loadModel() {
+  try {
+    model = tf.sequential();
+    model.add(tf.layers.conv2d({ inputShape: [28, 28, 1], filters: 32, kernelSize: 3, activation: "relu" }));
+    model.add(tf.layers.maxPooling2d({ poolSize: 2 }));
+    model.add(tf.layers.conv2d({ filters: 64, kernelSize: 3, activation: "relu" }));
+    model.add(tf.layers.maxPooling2d({ poolSize: 2 }));
+    model.add(tf.layers.flatten());
+    model.add(tf.layers.dense({ units: 128, activation: "relu" }));
+    model.add(tf.layers.dense({ units: 10, activation: "softmax" }));
+    const ws = await (await fetch("weights.json")).json();
+    const tensors = ws.map(w => tf.tensor(w.data, w.shape));
+    model.setWeights(tensors);
+    tensors.forEach(t => t.dispose());
+    document.getElementById("status").innerText = "Model ready. Draw a digit!";
+  } catch (err) {
+    model = null;
+    document.getElementById("status").innerText = "Model failed to load: " + err.message;
+  }
+}
+loadModel();
+</script>
+</body>
+</html>
